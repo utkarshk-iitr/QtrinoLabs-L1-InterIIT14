@@ -58,16 +58,18 @@ int main (int argc, char** argv)
         goto cleanup;
     }
 
+    /* Set single supported curve/group to prevent multiple key shares */
+    if (wolfSSL_CTX_UseSupportedCurve(ctx, WOLFSSL_ML_KEM_512) != WOLFSSL_SUCCESS) {
+        fprintf(stderr, "Failed to set ML-KEM group\n");
+        goto cleanup;
+    }
+    printf("Configured group: WOLFSSL_ML_KEM_512\n");
+
     /* Assign ssl variable */
     ssl = wolfSSL_new(ctx);
     if (ssl == NULL) {
         fprintf(stderr, "unable to get ssl object\n");
         goto cleanup;
-    }
-
-    /* Enable Kyber768 key share on SSL object */
-    if (wolfSSL_UseKeyShare(ssl, WOLFSSL_ML_KEM_768) == WOLFSSL_SUCCESS) {
-        printf("Kyber768 key share enabled on client\n");
     }
 
     /* servAddr setup */
@@ -105,6 +107,24 @@ int main (int argc, char** argv)
     }
 
     showConnInfo(ssl);
+
+    /* Extract shared secret derived from ML-KEM key exchange for later AES-GCM encryption */
+    unsigned char key_material[32];  /* 256-bit key for AES-256-GCM */
+    const char* label = "EXPORTER-key-for-aes-gcm";
+    
+    ret = wolfSSL_export_keying_material(ssl, key_material, sizeof(key_material), 
+                                          label, strlen(label), NULL, 0, 0);
+    if (ret == WOLFSSL_SUCCESS) {
+        printf("\n=== Extracted Shared Secret from ML-KEM Key Exchange ===\n");
+        printf("Shared Secret (32 bytes for AES-256-GCM): ");
+        for (unsigned int i = 0; i < sizeof(key_material); i++) {
+            printf("%02x", key_material[i]);
+        }
+        printf("\n\n");
+        printf("✓ You can now use this shared secret for AES-GCM encryption\n\n");
+    } else {
+        fprintf(stderr, "Failed to export keying material\n");
+    }
 
     while (1) {
         if (fgets(sendLine, MAXLINE, stdin) == NULL)
