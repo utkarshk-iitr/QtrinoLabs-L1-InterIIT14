@@ -60,7 +60,7 @@ int main (int argc, char** argv)
     }
 
     /* Set single supported curve/group to prevent multiple key shares */
-    if (wolfSSL_CTX_UseSupportedCurve(ctx, WOLFSSL_ML_KEM_1024) != WOLFSSL_SUCCESS) {
+    if (wolfSSL_CTX_UseSupportedCurve(ctx, WOLFSSL_ML_KEM_512) != WOLFSSL_SUCCESS) {
         fprintf(stderr, "Failed to set ML-KEM group\n");
         goto cleanup;
     }
