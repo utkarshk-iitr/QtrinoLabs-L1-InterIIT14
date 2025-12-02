@@ -2,6 +2,7 @@
 #include <stdio.h>                  /* standard in/out procedures */
 #include <stdlib.h>                 /* defines system calls */
 #include <string.h>                 /* necessary for memset */
+#include <wolfssl/wolfcrypt/aes.h>
 #include <netdb.h>
 #include <sys/socket.h>             /* used for all socket calls */
 #include <netinet/in.h>             /* used for sockaddr_in */
@@ -22,16 +23,19 @@ static void free_resources(void);
 
 int main(int argc, char** argv)
 {
-    /* Loc short for "location" */
+    if(argc != 2) {
+        fprintf(stderr, "Usage: %s <Port>\n", argv[0]);
+        return 1;
+    }
     int           exitVal = 1;
-    struct sockaddr_in servAddr;        /* our server's address */
-    struct sockaddr_in cliaddr;         /* the client's address */
+    struct sockaddr_in servAddr;
+    struct sockaddr_in cliaddr;
     int           ret;
     int           err;
-    int           recvLen = 0;    /* length of message */
+    int           recvLen = 0;
     socklen_t     cliLen;
-    char          buff[MAXLINE];   /* the incoming message */
-    char          ack[] = "I hear you fashizzle!\n";
+    char          buff[MAXLINE];
+    char          ack[] = "ACK: Message Got\n";
 
     if (wolfSSL_Init() != WOLFSSL_SUCCESS) {
         fprintf(stderr, "wolfSSL_Init error.\n");
@@ -64,21 +68,20 @@ int main(int argc, char** argv)
     }
 
     /* Set single supported curve/group to prevent multiple key shares */
-    if (wolfSSL_CTX_UseSupportedCurve(ctx, WOLFSSL_ML_KEM_512) != WOLFSSL_SUCCESS) {
+    if (wolfSSL_CTX_UseSupportedCurve(ctx, WOLFSSL_ML_KEM_1024) != WOLFSSL_SUCCESS) {
         fprintf(stderr, "Failed to set ML-KEM group\n");
         goto cleanup;
     }
-    printf("Configured group: WOLFSSL_ML_KEM_512\n");
+    printf("DTLS configured with WOLFSSL_ML_KEM_512\n");
 
     if ((listenfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0 ) {
         perror("socket()");
         goto cleanup;
     }
-    printf("Socket allocated\n");
     memset((char *)&servAddr, 0, sizeof(servAddr));
     servAddr.sin_family      = AF_INET;
     servAddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    servAddr.sin_port        = htons(SERV_PORT);
+    servAddr.sin_port        = htons(atoi(argv[1]));
 
     /* Bind Socket */
     if (bind(listenfd, (struct sockaddr*)&servAddr, sizeof(servAddr)) < 0) {
@@ -89,11 +92,10 @@ int main(int argc, char** argv)
     signal(SIGINT, sig_handler);
 
     while (1) {
-        printf("Awaiting client connection on port %d\n", SERV_PORT);
+        printf("Awaiting client connection on port %d\n", atoi(argv[1]));
 
         cliLen = sizeof(cliaddr);
-        ret = (int)recvfrom(listenfd, (char *)&buff, sizeof(buff), MSG_PEEK,
-                (struct sockaddr*)&cliaddr, &cliLen);
+        ret = (int)recvfrom(listenfd, (char *)&buff, sizeof(buff), MSG_PEEK,(struct sockaddr*)&cliaddr, &cliLen);
 
         if (ret < 0) {
             perror("recvfrom()");
@@ -132,28 +134,56 @@ int main(int argc, char** argv)
 
         /* Extract shared secret derived from ML-KEM key exchange for later AES-GCM encryption */
         unsigned char key_material[32];  /* 256-bit key for AES-256-GCM */
-        const char* label = "EXPORTER-key-for-aes-gcm";
+        const char* label = "EXPORTER-key-for-aes-ctr";
         
         ret = wolfSSL_export_keying_material(ssl, key_material, sizeof(key_material), 
                                               label, strlen(label), NULL, 0, 0);
-        if (ret == WOLFSSL_SUCCESS) {
-            printf("\n=== Extracted Shared Secret from ML-KEM Key Exchange ===\n");
-            printf("Shared Secret (32 bytes for AES-256-GCM): ");
-            for (unsigned int i = 0; i < sizeof(key_material); i++) {
-                printf("%02x", key_material[i]);
-            }
-            printf("\n\n");
-            printf("✓ You can now use this shared secret for AES-GCM encryption\n\n");
-        } else {
+        if (ret != WOLFSSL_SUCCESS) {
             fprintf(stderr, "Failed to export keying material\n");
+            goto cleanup;
         }
+
+        printf("\nExtracted Shared Secret from ML-KEM Key Exchange\n");
+        // printf("Shared Secret (32 bytes for AES-256-CTR): ");
+        // for (unsigned int i = 0; i < sizeof(key_material); i++) {
+        //     printf("%02x", key_material[i]);
+        // }
+        // printf("\n\n");
+
+        /* Initialize AES context for encryption and decryption */
+        Aes aes_enc, aes_dec;
+        unsigned char iv_enc[AES_BLOCK_SIZE];
+        unsigned char iv_dec[AES_BLOCK_SIZE];
+        
+        /* Initialize IVs (in production, use proper IV management) */
+        memset(iv_enc, 0, AES_BLOCK_SIZE);
+        memset(iv_dec, 0, AES_BLOCK_SIZE);
+        
+        if (wc_AesSetKey(&aes_enc, key_material, sizeof(key_material), iv_enc, AES_ENCRYPTION) != 0) {
+            fprintf(stderr, "Failed to set AES encryption key\n");
+            goto cleanup;
+        }
+        
+        if (wc_AesSetKey(&aes_dec, key_material, sizeof(key_material), iv_dec, AES_ENCRYPTION) != 0) {
+            fprintf(stderr, "Failed to set AES decryption key\n");
+            goto cleanup;
+        }
+        
 
         while (1) {
             if ((recvLen = wolfSSL_read(ssl, buff, sizeof(buff)-1)) > 0) {
-                printf("heard %d bytes\n", recvLen);
+                unsigned char decrypted[MAXLINE];
+                
+                // printf("[Received %d encrypted bytes] ", recvLen);
+                
+                /* Decrypt the received message using AES-CTR */
+                if (wc_AesCtrEncrypt(&aes_dec, decrypted, (unsigned char*)buff, recvLen) != 0) {
+                    fprintf(stderr, "AES decryption failed\n");
+                    goto cleanup;
+                }
 
-                buff[recvLen] = '\0';
-                printf("I heard this: \"%s\"\n", buff);
+                decrypted[recvLen] = '\0';
+                printf("\nDecrypted: %s[Decrypted %d bytes]\n", decrypted, recvLen);
             }
             else if (recvLen <= 0) {
                 err = wolfSSL_get_error(ssl, 0);
@@ -164,8 +194,19 @@ int main(int argc, char** argv)
                 fprintf(stderr, "SSL_read failed.\n");
                 goto cleanup;
             }
-            printf("Sending reply.\n");
-            if (wolfSSL_write(ssl, ack, sizeof(ack)) < 0) {
+            
+            unsigned char encrypted_ack[MAXLINE];
+            
+            /* Encrypt the acknowledgment message using AES-CTR */
+            if (wc_AesCtrEncrypt(&aes_enc, encrypted_ack, (unsigned char*)ack, sizeof(ack)) != 0) {
+                fprintf(stderr, "AES encryption failed\n");
+                goto cleanup;
+            }
+            
+            // printf("[Sending encrypted reply of %lu bytes]\n\n", sizeof(ack));
+            printf("Sending encrypted ACK\n");
+            
+            if (wolfSSL_write(ssl, encrypted_ack, sizeof(ack)) < 0) {
                 err = wolfSSL_get_error(ssl, 0);
                 fprintf(stderr, "error = %d, %s\n", err,
                     wolfSSL_ERR_reason_error_string(err));
@@ -174,7 +215,7 @@ int main(int argc, char** argv)
             }
         }
 
-        printf("reply sent \"%s\"\n", ack);
+        // printf("reply sent %s\n", ack);
 
         /* Attempt a full shutdown */
         ret = wolfSSL_shutdown(ssl);
@@ -189,7 +230,7 @@ int main(int argc, char** argv)
         wolfSSL_free(ssl);
         ssl = NULL;
 
-        printf("Awaiting new connection\n");
+        printf("\nAwaiting new connection\n");
     }
 
     exitVal = 0;
