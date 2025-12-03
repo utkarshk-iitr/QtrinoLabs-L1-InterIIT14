@@ -15,8 +15,6 @@
 
 #define MAXLINE 4096
 const char caCertLoc[] = "./certs/ca_cert.pem";
-const char servCertLoc[] = "./certs/server_cert.pem";
-const char servKeyLoc[] = "./certs/server_key.pem";
 
 static inline void show_conn_info(WOLFSSL *ssl){
     printf("\nNew connection established using %s", wolfSSL_get_version(ssl));
@@ -124,7 +122,6 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    // Check if server has cached key material
     char server_response[MAXLINE];
     struct sockaddr_in from_addr;
     socklen_t from_len = sizeof(from_addr);
@@ -144,7 +141,7 @@ int main(int argc, char **argv)
         snprintf(filename, sizeof(filename), "client_keys/aes_key_%s.txt",argv[1]);
         FILE *key_file = fopen(filename, "r");
         if (key_file == NULL) {
-            fprintf(stderr, "Could not open aes_key file. Performing full handshake.\n");
+            fprintf(stderr, "Could not open %s file. Performing full handshake.\n", filename);
             goto full_hs;
         }
         
@@ -156,7 +153,6 @@ int main(int argc, char **argv)
         }
         fclose(key_file);
         
-        // Convert hex string to bytes
         for (unsigned int i = 0; i < 32; i++) {
             sscanf(&hex_key[i * 2], "%2hhx", &key_material[i]);
         }
@@ -169,7 +165,6 @@ int main(int argc, char **argv)
         // }
         // printf("\n\n");
 
-        // Setup fresh AES with zero IV for this session
         Aes aes_enc, aes_dec;
         unsigned char iv_enc[AES_BLOCK_SIZE];
         unsigned char iv_dec[AES_BLOCK_SIZE];
@@ -186,7 +181,6 @@ int main(int argc, char **argv)
             goto cleanup;
         }
 
-        // Communication loop without SSL - direct UDP with AES
         while (1) {
             if (fgets(sendLine, MAXLINE, stdin) == NULL)
                 break;
@@ -205,14 +199,11 @@ int main(int argc, char **argv)
             }
 
             printf("[Encrypted %d bytes]\n", msgLen);
-
-            // Send directly via UDP (no SSL)
             if (sendto(sockfd, encrypted, msgLen, 0, (struct sockaddr *)&servAddr, sizeof(servAddr)) != msgLen) {
                 perror("sendto()");
                 goto cleanup;
             }
 
-            // Receive directly via UDP (no SSL)
             struct sockaddr_in recv_addr;
             socklen_t recv_len = sizeof(recv_addr);
             n = recvfrom(sockfd, recvLine, sizeof(recvLine) - 1, 0, (struct sockaddr *)&recv_addr, &recv_len);
@@ -232,8 +223,7 @@ int main(int argc, char **argv)
             }
         }
 
-        exitVal = 0;
-        return exitVal;
+        return 0;
     }
 
     printf("Server requires full handshake.\n");
@@ -350,7 +340,7 @@ full_hs:
         }
         fprintf(key_file,"\n");
         fclose(key_file);
-        printf("Key material saved to aes_key.txt\n");
+        printf("Key material saved to %s\n", filename);
     } 
     else {
         perror("Failed to write key file");

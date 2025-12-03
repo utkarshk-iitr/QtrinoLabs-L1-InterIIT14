@@ -218,7 +218,7 @@ int main(int argc, char **argv)
         unsigned char key_material[32];
 
         if(cache_lookup(&cliaddr, key_material)){
-            printf("Session resumed! Using cached key");
+            printf("Session resumed! Using cached key\n");
             char resume_msg[] = "yes";
             if (sendto(listenfd, resume_msg, sizeof(resume_msg), 0, (struct sockaddr *)&cliaddr, cliLen) < 0) {
                 perror("Failed to send resume confirmation");
