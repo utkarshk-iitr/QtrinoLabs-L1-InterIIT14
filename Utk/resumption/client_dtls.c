@@ -135,8 +135,6 @@ int main(int argc, char **argv)
     server_response[recv_len] = '\0';
     
     if (strncmp(server_response, "yes", 3) == 0) {
-        printf("Server has cached key material. Loading from file...\n");
-        
         char filename[256];
         snprintf(filename, sizeof(filename), "client_keys/aes_key_%s.txt",argv[1]);
         FILE *key_file = fopen(filename, "r");

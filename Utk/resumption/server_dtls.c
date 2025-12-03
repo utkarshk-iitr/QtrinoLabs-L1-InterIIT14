@@ -11,9 +11,13 @@
 #include <errno.h>
 #include <signal.h>
 #include <unistd.h>
-#include <uthash.h>
+#include <time.h>
 
 #define MAXLINE 4096
+#define INITIAL_TABLE_SIZE 16
+#define MAX_LOAD_FACTOR 0.75
+#define CACHE_EXPIRY_SECONDS 10
+
 const char caCertLoc[] = "./certs/ca_cert.pem";
 const char servCertLoc[] = "./certs/server_cert.pem";
 const char servKeyLoc[] = "./certs/server_key.pem";
@@ -34,51 +38,338 @@ int listenfd = INVALID_SOCKET;
 static void sig_handler(const int sig);
 static void free_resources(void);
 
-typedef struct {
+typedef struct KeyCacheEntry {
     char ip_port[22];
     unsigned char key_material[32];
-    UT_hash_handle hh;
-} KeyCache;
+    time_t expiration_time;
+    int occupied;
+} KeyCacheEntry;
 
-KeyCache* cache = NULL;
+typedef struct SecondLevelTable {
+    KeyCacheEntry *entries;
+    size_t size;
+    unsigned int a, b;
+} SecondLevelTable;
+
+typedef struct DynamicPerfectHash {
+    SecondLevelTable *buckets;
+    size_t primary_size;
+    size_t num_elements;
+    unsigned int a, b; 
+    unsigned int prime;
+} DynamicPerfectHash;
+
+static DynamicPerfectHash *cache = NULL;
+#define HASH_PRIME 15485863
+
+static unsigned int universal_hash(const char *key, unsigned int a, unsigned int b, 
+                                   unsigned int prime, size_t table_size) {
+    unsigned int hash_val = 0;
+    for (size_t i = 0; key[i] != '\0'; i++) {
+        hash_val = (hash_val * 31 + (unsigned char)key[i]) % prime;
+    }
+    return ((a * hash_val + b) % prime) % table_size;
+}
+
+static void generate_hash_params(unsigned int *a, unsigned int *b, unsigned int prime) {
+    *a = (rand() % (prime - 1)) + 1;
+    *b = rand() % prime;
+}
+
+static int init_second_level_table(SecondLevelTable *table, KeyCacheEntry *entries, size_t num_entries) {
+    if (num_entries == 0) {
+        table->entries = NULL;
+        table->size = 0;
+        return 1;
+    }
+
+    table->size = num_entries * num_entries;
+    if (table->size == 0) table->size = 1;
+    
+    table->entries = calloc(table->size, sizeof(KeyCacheEntry));
+    if (!table->entries) {
+        return 0;
+    }
+
+    int max_attempts = 100;
+    for (int attempt = 0; attempt < max_attempts; attempt++) {
+        generate_hash_params(&table->a, &table->b, HASH_PRIME);
+        
+        for (size_t i = 0; i < table->size; i++) {
+            table->entries[i].occupied = 0;
+        }
+
+        int collision = 0;
+        for (size_t i = 0; i < num_entries; i++) {
+            unsigned int idx = universal_hash(entries[i].ip_port, table->a, table->b, HASH_PRIME, table->size);
+            
+            if (table->entries[idx].occupied) {
+                collision = 1;
+                break;
+            }
+            
+            table->entries[idx] = entries[i];
+            table->entries[idx].occupied = 1;
+        }
+
+        if (!collision) {
+            return 1;
+        }
+    }
+
+    generate_hash_params(&table->a, &table->b, HASH_PRIME);
+    for (size_t i = 0; i < table->size; i++) {
+        table->entries[i].occupied = 0;
+    }
+
+    for (size_t i = 0; i < num_entries; i++) {
+        unsigned int idx = universal_hash(entries[i].ip_port, table->a, table->b, HASH_PRIME, table->size);
+        
+        while (table->entries[idx].occupied) {
+            idx = (idx + 1) % table->size;
+        }
+        
+        table->entries[idx] = entries[i];
+        table->entries[idx].occupied = 1;
+    }
+
+    return 1;
+}
+
+static DynamicPerfectHash* dph_create(size_t initial_size) {
+    DynamicPerfectHash *hash = malloc(sizeof(DynamicPerfectHash));
+    if (!hash) return NULL;
+
+    hash->primary_size = initial_size;
+    hash->num_elements = 0;
+    hash->prime = HASH_PRIME;
+    
+    srand(time(NULL));
+    generate_hash_params(&hash->a, &hash->b, hash->prime);
+
+    hash->buckets = calloc(hash->primary_size, sizeof(SecondLevelTable));
+    if (!hash->buckets) {
+        free(hash);
+        return NULL;
+    }
+
+    return hash;
+}
+
+static int dph_rehash(DynamicPerfectHash *hash) {
+    size_t new_size = hash->primary_size * 2;
+    
+    KeyCacheEntry *all_entries = malloc(hash->num_elements * sizeof(KeyCacheEntry));
+    if (!all_entries) return 0;
+
+    size_t count = 0;
+    for (size_t i = 0; i < hash->primary_size; i++) {
+        SecondLevelTable *bucket = &hash->buckets[i];
+        if (bucket->entries) {
+            for (size_t j = 0; j < bucket->size; j++) {
+                if (bucket->entries[j].occupied) {
+                    all_entries[count++] = bucket->entries[j];
+                }
+            }
+            free(bucket->entries);
+        }
+    }
+
+    free(hash->buckets);
+
+    hash->primary_size = new_size;
+    hash->buckets = calloc(new_size, sizeof(SecondLevelTable));
+    if (!hash->buckets) {
+        free(all_entries);
+        return 0;
+    }
+
+    generate_hash_params(&hash->a, &hash->b, hash->prime);
+
+    for (size_t i = 0; i < count; i++) {
+        unsigned int idx = universal_hash(all_entries[i].ip_port, hash->a, hash->b, hash->prime, hash->primary_size);
+        
+        SecondLevelTable *bucket = &hash->buckets[idx];
+        size_t bucket_count = 0;
+        for (size_t j = 0; j < count; j++) {
+            unsigned int test_idx = universal_hash(all_entries[j].ip_port, hash->a, hash->b,
+                                                   hash->prime, hash->primary_size);
+            if (test_idx == idx) {
+                bucket_count++;
+            }
+        }
+
+        if (bucket_count > 0 && !bucket->entries) {
+            KeyCacheEntry *bucket_entries = malloc(bucket_count * sizeof(KeyCacheEntry));
+            size_t pos = 0;
+            for (size_t j = 0; j < count; j++) {
+                unsigned int test_idx = universal_hash(all_entries[j].ip_port, hash->a, hash->b,
+                                                       hash->prime, hash->primary_size);
+                if (test_idx == idx) {
+                    bucket_entries[pos++] = all_entries[j];
+                }
+            }
+            init_second_level_table(bucket, bucket_entries, bucket_count);
+            free(bucket_entries);
+        }
+    }
+
+    free(all_entries);
+    return 1;
+}
+
+static int dph_insert(DynamicPerfectHash *hash, const char *key, const unsigned char *value, time_t expiry) {
+    double load_factor = (double)hash->num_elements / hash->primary_size;
+    if (load_factor > MAX_LOAD_FACTOR) {
+        if (!dph_rehash(hash)) {
+            return 0;
+        }
+    }
+
+    unsigned int idx = universal_hash(key, hash->a, hash->b, hash->prime, hash->primary_size);
+    SecondLevelTable *bucket = &hash->buckets[idx];
+
+    if (bucket->entries) {
+        for (size_t i = 0; i < bucket->size; i++) {
+            if (bucket->entries[i].occupied && 
+                strcmp(bucket->entries[i].ip_port, key) == 0) {
+                // Update existing entry with new key and expiration time
+                memcpy(bucket->entries[i].key_material, value, 32);
+                bucket->entries[i].expiration_time = expiry;
+                // printf("Updated cache entry for %s (new expiration time: %ld)\n", key, expiry);
+                return 1;
+            }
+        }
+    }
+
+    size_t old_count = 0;
+    KeyCacheEntry *old_entries = NULL;
+    
+    if (bucket->entries) {
+        for (size_t i = 0; i < bucket->size; i++) {
+            if (bucket->entries[i].occupied) {
+                old_count++;
+            }
+        }
+        
+        if (old_count > 0) {
+            old_entries = malloc(old_count * sizeof(KeyCacheEntry));
+            size_t pos = 0;
+            for (size_t i = 0; i < bucket->size; i++) {
+                if (bucket->entries[i].occupied) {
+                    old_entries[pos++] = bucket->entries[i];
+                }
+            }
+        }
+        free(bucket->entries);
+        bucket->entries = NULL;
+    }
+
+    KeyCacheEntry *new_entries = malloc((old_count + 1) * sizeof(KeyCacheEntry));
+    for (size_t i = 0; i < old_count; i++) {
+        new_entries[i] = old_entries[i];
+    }
+    
+    strncpy(new_entries[old_count].ip_port, key, sizeof(new_entries[old_count].ip_port) - 1);
+    new_entries[old_count].ip_port[sizeof(new_entries[old_count].ip_port) - 1] = '\0';
+    memcpy(new_entries[old_count].key_material, value, 32);
+    new_entries[old_count].expiration_time = expiry;
+    new_entries[old_count].occupied = 1;
+    // printf("Inserted new cache entry for %s (expiration time: %ld)\n", key, expiry);
+
+    int success = init_second_level_table(bucket, new_entries, old_count + 1);
+    
+    free(new_entries);
+    if (old_entries) free(old_entries);
+
+    if (success) {
+        hash->num_elements++;
+        return 1;
+    }
+    
+    return 0;
+}
+
+static int dph_lookup(DynamicPerfectHash *hash, const char *key, unsigned char *value, int *expired) {
+    unsigned int idx = universal_hash(key, hash->a, hash->b, hash->prime, hash->primary_size);
+    SecondLevelTable *bucket = &hash->buckets[idx];
+
+    *expired = 0;
+
+    if (!bucket->entries) {
+        return 0;
+    }
+
+    time_t current_time = time(NULL);
+
+    for (size_t i = 0; i < bucket->size; i++) {
+        if (bucket->entries[i].occupied && 
+            strcmp(bucket->entries[i].ip_port, key) == 0) {
+            
+            // Check if entry has expired (lazy expiration)
+            if (current_time >= bucket->entries[i].expiration_time) {
+                // printf("Cache entry EXPIRED for %s (expiration time: %ld, current time: %ld)\n", 
+                //        key, bucket->entries[i].expiration_time, current_time);
+                *expired = 1;
+                return 1;  // Found but expired
+            }
+            
+            // Entry is valid and not expired
+            // printf("Cache HIT for %s (expiration time: %ld, current time: %ld)\n", 
+            //        key, bucket->entries[i].expiration_time, current_time);
+            memcpy(value, bucket->entries[i].key_material, 32);
+            return 1;
+        }
+    }
+
+    // printf("Cache MISS for %s (no entry found)\n", key);
+    return 0;
+}
+
+static void dph_destroy(DynamicPerfectHash *hash) {
+    if (!hash) return;
+
+    for (size_t i = 0; i < hash->primary_size; i++) {
+        if (hash->buckets[i].entries) {
+            free(hash->buckets[i].entries);
+        }
+    }
+    free(hash->buckets);
+    free(hash);
+}
 
 static void cache_store(const struct sockaddr_in *addr, const unsigned char *material) {
     char key[22];
     snprintf(key, sizeof(key), "%s:%d", inet_ntoa(addr->sin_addr), ntohs(addr->sin_port));
     
-    KeyCache *entry;
-    HASH_FIND_STR(cache, key, entry);
-    
-    if (!entry) {
-        entry = malloc(sizeof(KeyCache));
-        strcpy(entry->ip_port, key);
-        HASH_ADD_STR(cache, ip_port, entry);
+    if (!cache) {
+        cache = dph_create(INITIAL_TABLE_SIZE);
+        if (!cache) {
+            fprintf(stderr, "Failed to create cache\n");
+            return;
+        }
     }
     
-    memcpy(entry->key_material, material, 32);
+    time_t expiration = time(NULL) + CACHE_EXPIRY_SECONDS;
+    dph_insert(cache, key, material, expiration);
 }
 
-static int cache_lookup(const struct sockaddr_in *addr, unsigned char *material) {
+static int cache_lookup(const struct sockaddr_in *addr, unsigned char *material, int *expired) {
+    if (!cache) {
+        return 0;
+    }
+
     char key[22];
     snprintf(key, sizeof(key), "%s:%d", inet_ntoa(addr->sin_addr), ntohs(addr->sin_port));
     
-    KeyCache *entry;
-    HASH_FIND_STR(cache, key, entry);
-    
-    if (entry) {
-        memcpy(material, entry->key_material, 32);
-        return 1;
-    }
-    return 0;
+    return dph_lookup(cache, key, material, expired);
 }
 
 static void cache_clear(void) {
-    KeyCache *entry, *tmp;
-    HASH_ITER(hh, cache, entry, tmp) {
-        HASH_DEL(cache, entry);
-        free(entry);
+    if (cache) {
+        dph_destroy(cache);
+        cache = NULL;
     }
-    cache = NULL;
 }
 
 int main(int argc, char **argv)
@@ -216,8 +507,9 @@ int main(int argc, char **argv)
         }
         printf("Client connected from %s:%d\n", inet_ntoa(cliaddr.sin_addr), ntohs(cliaddr.sin_port));
         unsigned char key_material[32];
+        int is_expired = 0;
 
-        if(cache_lookup(&cliaddr, key_material)){
+        if(cache_lookup(&cliaddr, key_material, &is_expired) && !is_expired){
             printf("Session resumed! Using cached key\n");
             char resume_msg[] = "yes";
             if (sendto(listenfd, resume_msg, sizeof(resume_msg), 0, (struct sockaddr *)&cliaddr, cliLen) < 0) {
@@ -311,6 +603,13 @@ int main(int argc, char **argv)
             
             printf("\nClient disconnected. Awaiting new connection...\n");
             continue;
+        }
+
+        // Cache entry either doesn't exist or is expired - perform full handshake
+        if (is_expired) {
+            printf("Cache entry expired! Performing full handshake and updating cache...\n");
+        } else {
+            printf("No cache entry found! Performing full handshake...\n");
         }
 
         char handshake_msg[] = "no";
