@@ -55,7 +55,8 @@ void set_conio_terminal_mode(void)
   struct termios new_termios;
 
   tcgetattr(0, &new_termios);
-  new_termios.c_lflag &= ~(ECHO | ICANON);
+  // keep typing echo on
+  new_termios.c_lflag &= ~(ICANON);
   tcsetattr(0, TCSANOW, &new_termios);
 }
 

@@ -1,4 +1,4 @@
-BUILD_DIR?=../build/
+BUILD_DIR?=../build/sim/
 
 include $(BUILD_DIR)/software/include/generated/variables.mak
 include $(SOC_DIRECTORY)/software/common.mak
@@ -32,7 +32,8 @@ OBJECTS += $(SRCS:.c=.o)
 INC  = -I./wolfssl -I./wolfssl/wolfcrypt -I.
 
 # LiteETH includes (adjust path as needed for your LiteX installation)
-# INC += -I$(SOC_DIRECTORY)/software/libliteeth
+INC += -I../litex/litex/soc/software
+INC += -I../litex/litex/soc/software/libliteeth
 
 all: boot.bin
 

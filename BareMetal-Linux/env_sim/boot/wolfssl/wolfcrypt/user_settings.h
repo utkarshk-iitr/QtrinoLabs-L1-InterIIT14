@@ -44,6 +44,8 @@
 #define WOLFSSL_DTLS                /* Enable DTLS support */
 #define WOLFSSL_DTLS13              /* Enable DTLS 1.3 */
 #define WOLFSSL_TLS13               /* Enable TLS 1.3 (required for DTLS 1.3) */
+#define WOLFSSL_DTLS_MTU            /* Track MTU for proper fragmentation/ACK */
+#define WOLFSSL_DTLS_CH_FRAG        /* Allow ClientHello fragmentation for PQ */
 #define HAVE_TLS_EXTENSIONS         /* TLS extensions support */
 #define HAVE_SUPPORTED_CURVES       /* Supported curves extension */
 #define HAVE_EXTENDED_MASTER        /* Extended master secret */
@@ -54,6 +56,9 @@
 #define WOLFSSL_DTLS_CID            /* DTLS Connection ID support */
 #define WOLFSSL_SEND_HRR_COOKIE     /* Handle HelloRetryRequest cookie from server */
 #define HAVE_SESSION_TICKET         /* Session ticket support for TLS 1.3 */
+
+/* Enable proactive ACK sending for fragmented PQ handshakes */
+#define WOLFSSL_DTLS13_SEND_MOREACK_DEFAULT 1
 
 /*=============================================================================
  * Cryptographic Algorithm Support

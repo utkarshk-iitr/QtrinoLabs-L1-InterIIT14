@@ -4,207 +4,425 @@
 #include "wolfssl_io.h"
 #include "certs_buffer.h"
 
-#include <wolfssl/wolfcrypt/user_settings.h>
+#include "liteeth_udp.h"
+
+#include <wolfssl/wolfcrypt/settings.h>
 #include <wolfssl/ssl.h>
-#include <wolfssl/wolfcrypt/random.h>
+#include <wolfssl/error-ssl.h>
+#include <wolfssl/wolfcrypt/types.h>
+
+static int dtls_want_read_or_write(int err) {
+    return (err == WOLFSSL_ERROR_WANT_READ || err == WOLFSSL_ERROR_WANT_WRITE ||
+            err == WOLFSSL_ERROR_WANT_READ_E || err == WOLFSSL_ERROR_WANT_WRITE_E ||
+            err == WANT_READ || err == WANT_WRITE ||
+            err == WOLFSSL_CBIO_ERR_WANT_READ || err == WOLFSSL_CBIO_ERR_WANT_WRITE);
+}
+
+#define DTLS_CLIENT_DEBUG 0
+#define DEBUG_WOLFSSL 0
+
+#if DTLS_CLIENT_DEBUG
+#define DTLS_DBG(fmt, ...) printf("[DTLS] " fmt, ##__VA_ARGS__)
+#else
+#define DTLS_DBG(fmt, ...)
+#endif
+
+
 
 static int g_system_initialized = 0;
-static WC_RNG g_rng;
-
-#define DTLS_DEBUG(fmt, ...) \
-    printf("[DTLS_CLIENT] " fmt "\n", ##__VA_ARGS__)
-
-#define DTLS_ERROR(fmt, ...) \
-    printf("[DTLS_CLIENT ERROR] " fmt "\n", ##__VA_ARGS__)
-
-
-int dtls_client_init_system(const uint8_t* mac, uint32_t ip) {
+int dtls_client_init_system(const uint8_t *mac, uint32_t ip) {
     int ret;
     
     if (g_system_initialized) {
-        DTLS_DEBUG("System already initialized");
-        return 0;
+        DTLS_DBG("System already initialized\n");
+        return DTLS_CLIENT_SUCCESS;
     }
     
-    DTLS_DEBUG("Initializing DTLS client system...");
-    
-    ret = wc_InitRng(&g_rng);
-    if (ret != 0) {
-        DTLS_ERROR("Failed to initialize RNG: %d", ret);
-        return -1;
-    }
+    DTLS_DBG("Initializing DTLS system...\n");
     
     ret = wolfSSL_Init();
     if (ret != WOLFSSL_SUCCESS) {
-        DTLS_ERROR("wolfSSL_Init failed: %d", ret);
-        wc_FreeRng(&g_rng);
-        return -1;
+        DTLS_DBG("wolfSSL_Init failed: %d\n", ret);
+        return DTLS_CLIENT_SSL_ERROR;
     }
+    DTLS_DBG("wolfSSL initialized\n");
     
-#ifdef DEBUG_WOLFSSL
-    wolfSSL_Debugging_ON();
-#endif
+    #if DEBUG_WOLFSSL
+        wolfSSL_Debugging_ON();
+        DTLS_DBG("wolfSSL debugging enabled\n");
+    #endif
+    
     
     ret = liteeth_init(mac, ip);
-    if (ret != 0) {
-        DTLS_ERROR("LiteETH init failed: %d", ret);
+    if (ret != LITEETH_UDP_SUCCESS) {
+        DTLS_DBG("liteeth_init failed: %d\n", ret);
         wolfSSL_Cleanup();
-        wc_FreeRng(&g_rng);
-        return -1;
+        return DTLS_CLIENT_ERROR;
     }
     
     g_system_initialized = 1;
-    DTLS_DEBUG("System initialization complete");
+    DTLS_DBG("DTLS system initialized successfully\n");
     
-    return 0;
+    return DTLS_CLIENT_SUCCESS;
 }
 
 void dtls_client_cleanup_system(void) {
-    if (g_system_initialized) {
-        wolfSSL_Cleanup();
-        wc_FreeRng(&g_rng);
-        g_system_initialized = 0;
-        DTLS_DEBUG("System cleanup complete");
+    if (!g_system_initialized) {
+        return;
     }
+    
+    DTLS_DBG("Cleaning up DTLS system...\n");
+    
+    liteeth_udp_cleanup();
+    wolfSSL_Cleanup();
+    
+    g_system_initialized = 0;
+    DTLS_DBG("DTLS system cleaned up\n");
 }
 
-void dtls_client_config_init(dtls_client_config_t* config) {
-
-    if (config == NULL) return;
+void dtls_client_config_init(dtls_client_config_t *config) {
+    if (config == NULL) {
+        return;
+    }
     
     memset(config, 0, sizeof(dtls_client_config_t));
-    
-    config->server_port = DTLS_SERVER_PORT;
-    config->local_port = DTLS_CLIENT_PORT;
-    config->handshake_timeout = 30000;
-    config->recv_timeout = 5000;
+    config->local_port = DTLS_CLIENT_LOCAL_PORT;
     config->verify_peer = 1;
-    config->debug_enabled = 1;
 }
 
-void dtls_client_config_set_server(dtls_client_config_t* config, 
-                                    uint32_t ip, uint16_t port) {
-
-    if (config == NULL) return;
+void dtls_client_config_set_server(dtls_client_config_t *config, uint32_t ip, uint16_t port) {
+    if (config == NULL) {
+        return;
+    }
+    
     config->server_ip = ip;
     config->server_port = port;
 }
 
-void dtls_client_config_set_ca_cert(dtls_client_config_t* config,
-                                     const uint8_t* cert, size_t len) {
-
-    if (config == NULL) return;
+void dtls_client_config_set_ca_cert(dtls_client_config_t *config, const uint8_t *cert, size_t len) {
+    if (config == NULL) {
+        return;
+    }
+    
     config->ca_cert = cert;
     config->ca_cert_len = len;
 }
 
-int dtls_client_init(dtls_client_t* client, const dtls_client_config_t* config) {
-
+int dtls_client_init(dtls_client_t *client, const dtls_client_config_t *config) {
     int ret;
     
-    if (client == NULL || config == NULL) {
-        DTLS_ERROR("Invalid parameters");
-        return -1;
+    if (!g_system_initialized) {
+        DTLS_DBG("System not initialized\n");
+        return DTLS_CLIENT_NOT_INIT;
     }
     
-    if (!g_system_initialized) {
-        DTLS_ERROR("System not initialized - call dtls_client_init_system first");
-        return -1;
+    if (client == NULL || config == NULL) {
+        return DTLS_CLIENT_ERROR;
     }
     
     memset(client, 0, sizeof(dtls_client_t));
     
-    DTLS_DEBUG("Creating DTLS 1.3 client context...");
-    
+    DTLS_DBG("Creating DTLS 1.3 client context...\n");
     
     client->ctx = wolfSSL_CTX_new(wolfDTLSv1_3_client_method());
     if (client->ctx == NULL) {
-        DTLS_ERROR("wolfSSL_CTX_new failed");
-        return -1;
+        DTLS_DBG("Failed to create wolfSSL context\n");
+        return DTLS_CLIENT_SSL_ERROR;
     }
-    
     
     ret = wolfssl_io_register_callbacks(client->ctx);
     if (ret != 0) {
-        DTLS_ERROR("Failed to register IO callbacks");
+        DTLS_DBG("Failed to set up I/O callbacks\n");
         wolfSSL_CTX_free(client->ctx);
-        return -1;
+        return DTLS_CLIENT_ERROR;
     }
     
-    wolfssl_io_set_timeout(config->recv_timeout);
+    ret = wolfSSL_CTX_UseSupportedCurve(client->ctx, WOLFSSL_ML_KEM_512);
+    if (ret != WOLFSSL_SUCCESS) {
+        DTLS_DBG("Warning: Failed to set ML-KEM-512 support: %d\n", ret);
+    } else {
+        DTLS_DBG("ML-KEM-512 key exchange enabled\n");
+    }
     
-    if (config->ca_cert != NULL && config->ca_cert_len > 0) {
-        DTLS_DEBUG("Loading CA certificate (%zu bytes)...", config->ca_cert_len);
-        ret = wolfSSL_CTX_load_verify_buffer(client->ctx, 
-                                              config->ca_cert, 
-                                              (long)config->ca_cert_len,
-                                              WOLFSSL_FILETYPE_ASN1);
+    if (config->verify_peer && config->ca_cert != NULL && config->ca_cert_len > 0) {
+        DTLS_DBG("Loading CA certificate (%u bytes)...\n", (unsigned)config->ca_cert_len);
+        
+        ret = wolfSSL_CTX_load_verify_buffer(client->ctx, config->ca_cert, (long)config->ca_cert_len, WOLFSSL_FILETYPE_ASN1);
+        
         if (ret != WOLFSSL_SUCCESS) {
-            DTLS_ERROR("Failed to load CA certificate: %d", ret);
-            wolfSSL_CTX_free(client->ctx);
-            return -1;
+            ret = wolfSSL_CTX_load_verify_buffer(client->ctx, config->ca_cert, (long)config->ca_cert_len, WOLFSSL_FILETYPE_PEM);
         }
-    } else if (config->verify_peer) {
-        DTLS_ERROR("Peer verification enabled but no CA certificate provided");
-        wolfSSL_CTX_free(client->ctx);
-        return -1;
+        
+        if (ret != WOLFSSL_SUCCESS) {
+            DTLS_DBG("Failed to load CA certificate: %d\n", ret);
+            wolfSSL_CTX_free(client->ctx);
+            return DTLS_CLIENT_CERT_ERROR;
+        }
+        DTLS_DBG("CA certificate loaded\n");
+        
+        wolfSSL_CTX_set_verify(client->ctx, WOLFSSL_VERIFY_PEER, NULL);
+
+    } else {
+        DTLS_DBG("Peer verification disabled\n");
+        wolfSSL_CTX_set_verify(client->ctx, WOLFSSL_VERIFY_NONE, NULL);
     }
     
     if (config->client_cert != NULL && config->client_cert_len > 0) {
-        DTLS_DEBUG("Loading client certificate...");
-        ret = wolfSSL_CTX_use_certificate_buffer(client->ctx,
-                                                  config->client_cert,
-                                                  (long)config->client_cert_len,
-                                                  WOLFSSL_FILETYPE_ASN1);
+        ret = wolfSSL_CTX_use_certificate_buffer(client->ctx, config->client_cert, (long)config->client_cert_len, WOLFSSL_FILETYPE_ASN1);
+        
         if (ret != WOLFSSL_SUCCESS) {
-            DTLS_ERROR("Failed to load client certificate: %d", ret);
-            wolfSSL_CTX_free(client->ctx);
-            return -1;
+            ret = wolfSSL_CTX_use_certificate_buffer(client->ctx, config->client_cert, (long)config->client_cert_len, WOLFSSL_FILETYPE_PEM);
         }
+        
+        if (ret != WOLFSSL_SUCCESS) {
+            DTLS_DBG("Failed to load client certificate: %d\n", ret);
+            wolfSSL_CTX_free(client->ctx);
+            return DTLS_CLIENT_CERT_ERROR;
+        }
+        DTLS_DBG("Client certificate loaded\n");
     }
     
     if (config->client_key != NULL && config->client_key_len > 0) {
-        DTLS_DEBUG("Loading client private key...");
         ret = wolfSSL_CTX_use_PrivateKey_buffer(client->ctx,
                                                  config->client_key,
                                                  (long)config->client_key_len,
                                                  WOLFSSL_FILETYPE_ASN1);
         if (ret != WOLFSSL_SUCCESS) {
-            DTLS_ERROR("Failed to load client private key: %d", ret);
-            wolfSSL_CTX_free(client->ctx);
-            return -1;
+            ret = wolfSSL_CTX_use_PrivateKey_buffer(client->ctx,
+                                                     config->client_key,
+                                                     (long)config->client_key_len,
+                                                     WOLFSSL_FILETYPE_PEM);
         }
+        
+        if (ret != WOLFSSL_SUCCESS) {
+            DTLS_DBG("Failed to load client private key: %d\n", ret);
+            wolfSSL_CTX_free(client->ctx);
+            return DTLS_CLIENT_CERT_ERROR;
+        }
+        DTLS_DBG("Client private key loaded\n");
     }
     
-    if (config->verify_peer) {
-        wolfSSL_CTX_set_verify(client->ctx, WOLFSSL_VERIFY_PEER, NULL);
-    } else {
-        wolfSSL_CTX_set_verify(client->ctx, WOLFSSL_VERIFY_NONE, NULL);
-    }
-    
-    ret = liteeth_udp_ctx_init(&client->udp_ctx,
-                               config->local_port,
-                               config->server_ip,
-                               config->server_port);
-    if (ret != 0) {
-        DTLS_ERROR("Failed to initialize UDP context");
+    DTLS_DBG("Creating SSL session...\n");
+    client->ssl = wolfSSL_new(client->ctx);
+    if (client->ssl == NULL) {
+        DTLS_DBG("Failed to create SSL session\n");
         wolfSSL_CTX_free(client->ctx);
-        return -1;
+        return DTLS_CLIENT_SSL_ERROR;
+    }
+    
+    ret = wolfSSL_UseKeyShare(client->ssl, WOLFSSL_ML_KEM_512);
+    if (ret != WOLFSSL_SUCCESS) {
+        DTLS_DBG("Warning: Failed to set ML-KEM-512 key share: %d\n", ret);
+    }
+    
+    // ret = wolfSSL_dtls_set_mtu(client->ssl, 1400);
+    // if (ret != WOLFSSL_SUCCESS) {
+    //     DTLS_DBG("Warning: Failed to set DTLS MTU: %d\n", ret);
+    // } else {
+    //     DTLS_DBG("DTLS MTU set to 1400\n");
+    // }
+    
+    wolfSSL_dtls13_set_send_more_acks(client->ssl, 1);
+    DTLS_DBG("Enabled aggressive ACK sending for DTLS 1.3\n");
+    
+    DTLS_DBG("Setting up UDP connection to " IP_FMT ":%u...\n",
+             IP_ARGS(config->server_ip), config->server_port);
+    
+    ret = liteeth_udp_connect(&client->udp_ctx, config->local_port, config->server_ip, config->server_port);
+    if (ret != LITEETH_UDP_SUCCESS) {
+        DTLS_DBG("Failed to connect UDP: %d\n", ret);
+        wolfSSL_free(client->ssl);
+        wolfSSL_CTX_free(client->ctx);
+        return DTLS_CLIENT_CONNECT_ERROR;
+    }
+    
+    ret = wolfssl_io_set_udp_ctx(client->ssl, &client->udp_ctx);
+    if (ret != 0) {
+        DTLS_DBG("Failed to set I/O context\n");
+        liteeth_udp_close(&client->udp_ctx);
+        wolfSSL_free(client->ssl);
+        wolfSSL_CTX_free(client->ctx);
+        return DTLS_CLIENT_ERROR;
     }
     
     client->initialized = 1;
-    DTLS_DEBUG("DTLS client initialized successfully");
+    DTLS_DBG("DTLS client initialized\n");
     
+    return DTLS_CLIENT_SUCCESS;
+}
+
+int dtls_client_connect(dtls_client_t *client) {
+    int ret;
+    int err;
+    int attempts = 0;
+    int timeout_count = 0;
+    const int max_attempts = 5000;
+    
+    if (client == NULL || !client->initialized) {
+        return DTLS_CLIENT_NOT_INIT;
+    }
+    
+    DTLS_DBG("Starting DTLS handshake...\n");
+    
+    do {
+        ret = wolfSSL_connect(client->ssl);
+        
+        if (ret == WOLFSSL_SUCCESS) {
+            break;
+        }
+        
+        err = wolfSSL_get_error(client->ssl, ret);
+
+        if (dtls_want_read_or_write(err)) {
+            /* Service the network once per WANT_* to avoid burning cycles in sim. */
+            liteeth_udp_service();
+
+            /* Every so often, ask wolfSSL to handle DTLS retransmission timers. */
+            if ((attempts % 64) == 0) {
+                (void)wolfSSL_dtls_get_current_timeout(client->ssl);
+                timeout_count++;
+                if (timeout_count >= 4) {
+                    ret = wolfSSL_dtls_got_timeout(client->ssl);
+                    if (ret == WOLFSSL_SUCCESS) {
+                        timeout_count = 0;
+                    }
+                }
+            }
+
+            attempts++;
+            continue;
+        }
+        
+        DTLS_DBG("Handshake failed (err=%d, ret=%d)\n", err, ret);
+        
+        return DTLS_CLIENT_CONNECT_ERROR;
+        
+    } while (attempts < max_attempts);
+    
+    if (ret != WOLFSSL_SUCCESS) {
+        DTLS_DBG("Handshake timeout after %d attempts\n", attempts);
+        return DTLS_CLIENT_CONNECT_ERROR;
+    }
+    
+    client->connected = 1;
+    
+    DTLS_DBG("DTLS connection established!\n");
+    DTLS_DBG("Protocol: %s\n", wolfSSL_get_version(client->ssl));
+    DTLS_DBG("Cipher: %s\n", wolfSSL_get_cipher(client->ssl));
+    
+    return DTLS_CLIENT_SUCCESS;
+}
+
+int dtls_client_send(dtls_client_t *client, const uint8_t *data, size_t len) {
+    int ret;
+    int err;
+    int attempts = 0;
+    const int max_attempts = 200;
+    
+    if (client == NULL || !client->connected) {
+        return DTLS_CLIENT_NOT_INIT;
+    }
+    
+    DTLS_DBG("Sending %u bytes...\n", (unsigned)len);
+    
+    do {
+        ret = wolfSSL_write(client->ssl, data, (int)len);
+        if (ret > 0) {
+            break;
+        }
+
+        err = wolfSSL_get_error(client->ssl, ret);
+        if (dtls_want_read_or_write(err)) {
+            liteeth_udp_service();
+            attempts++;
+            continue;
+        }
+
+        DTLS_DBG("Send failed: error %d\n", err);
+        return DTLS_CLIENT_ERROR;
+    } while (attempts < max_attempts);
+
+    if (ret <= 0) {
+        DTLS_DBG("Send timeout (last ret=%d)\n", ret);
+        return 0;
+    }
+    
+    DTLS_DBG("Sent %d bytes\n", ret);
+    return ret;
+}
+
+int dtls_client_recv(dtls_client_t *client, uint8_t *buf, size_t maxlen) {
+    int ret;
+    int err;
+    int attempts = 0;
+    const int max_attempts = 50;
+    
+    if (client == NULL || !client->connected) {
+        return DTLS_CLIENT_NOT_INIT;
+    }
+    
+    DTLS_DBG("Receiving (max %u bytes)...\n", (unsigned)maxlen);
+    
+    do {
+        ret = wolfSSL_read(client->ssl, buf, (int)maxlen);
+        
+        if (ret > 0) {
+            DTLS_DBG("Received %d bytes\n", ret);
+            return ret;
+        }
+        
+        err = wolfSSL_get_error(client->ssl, ret);
+
+        if (dtls_want_read_or_write(err)) {
+            liteeth_udp_service();
+            attempts++;
+            continue;
+        }
+        
+        if (err == WOLFSSL_ERROR_ZERO_RETURN) {
+            DTLS_DBG("Connection closed by peer\n");
+            client->connected = 0;
+            return 0;
+        }
+        
+        DTLS_DBG("Receive failed: error %d\n", err);
+        return DTLS_CLIENT_ERROR;
+        
+    } while (attempts < max_attempts);
+    
+    DTLS_DBG("Receive timeout\n");
     return 0;
 }
 
-void dtls_client_cleanup(dtls_client_t* client) {
+void dtls_client_disconnect(dtls_client_t *client) {
+    if (client == NULL || !client->connected) {
+        return;
+    }
+    
+    DTLS_DBG("Disconnecting...\n");
+    
+    int ret = wolfSSL_shutdown(client->ssl);
+    if (ret == WOLFSSL_SHUTDOWN_NOT_DONE) {
+        wolfSSL_shutdown(client->ssl);
+    }
+    
+    client->connected = 0;
+    
+    DTLS_DBG("Disconnected\n");
+}
 
-    if (client == NULL) return;
+void dtls_client_cleanup(dtls_client_t *client) {
+    if (client == NULL) {
+        return;
+    }
+    
+    DTLS_DBG("Cleaning up client...\n");
     
     if (client->connected) {
         dtls_client_disconnect(client);
     }
+    
+    liteeth_udp_close(&client->udp_ctx);
     
     if (client->ssl != NULL) {
         wolfSSL_free(client->ssl);
@@ -216,195 +434,19 @@ void dtls_client_cleanup(dtls_client_t* client) {
         client->ctx = NULL;
     }
     
-    liteeth_udp_ctx_free(&client->udp_ctx);
-    
     client->initialized = 0;
-    DTLS_DEBUG("DTLS client cleanup complete");
+    
+    DTLS_DBG("Client cleaned up\n");
 }
 
-int dtls_client_connect(dtls_client_t* client) {
-
-    int ret;
-    int err;
-    
-    if (client == NULL || !client->initialized) {
-        DTLS_ERROR("Client not initialized");
-        return -1;
-    }
-    
-    if (client->connected) {
-        DTLS_DEBUG("Already connected");
-        return 0;
-    }
-    
-    DTLS_DEBUG("Creating SSL session...");
-    
-    
-    client->ssl = wolfSSL_new(client->ctx);
-    if (client->ssl == NULL) {
-        DTLS_ERROR("wolfSSL_new failed");
-        return -1;
-    }
-    
-    
-    DTLS_DEBUG("Setting ML-KEM-512 key share...");
-    ret = wolfSSL_UseKeyShare(client->ssl, WOLFSSL_ML_KEM_512);
-    if (ret != WOLFSSL_SUCCESS) {
-        DTLS_ERROR("Failed to set ML-KEM-512 key share: %d", ret);
-        wolfSSL_free(client->ssl);
-        client->ssl = NULL;
-        return -1;
-    }
-    
-    wolfssl_io_set_udp_ctx(client->ssl, &client->udp_ctx);
-    
-    DTLS_DEBUG("Starting DTLS 1.3 handshake with " IP_FMT ":%d...",
-               IP_ARGS(client->udp_ctx.remote_ip), 
-               client->udp_ctx.remote_port);
-    
-    ret = wolfSSL_connect(client->ssl);
-    
-    if (ret != WOLFSSL_SUCCESS) {
-        err = wolfSSL_get_error(client->ssl, ret);
-        DTLS_ERROR("wolfSSL_connect failed: error=%d (%s)", 
-                   err, wolfSSL_ERR_reason_error_string(err));
-        wolfSSL_free(client->ssl);
-        client->ssl = NULL;
-        return -1;
-    }
-    
-    client->connected = 1;
-    
-    DTLS_DEBUG("DTLS 1.3 handshake successful!");
-    dtls_client_print_info(client);
-    
-    return 0;
-}
-
-int dtls_client_disconnect(dtls_client_t* client) {
-
-    int ret;
-    if (client == NULL || client->ssl == NULL) {
+int dtls_client_get_conn_info(dtls_client_t *client, char *buf, size_t maxlen) {
+    if (client == NULL || buf == NULL || maxlen == 0) {
         return 0;
     }
     
     if (!client->connected) {
-        return 0;
+        return snprintf(buf, maxlen, "Not connected");
     }
     
-    DTLS_DEBUG("Disconnecting...");
-    
-    ret = wolfSSL_shutdown(client->ssl);
-    if (ret == WOLFSSL_SHUTDOWN_NOT_DONE) {
-        
-        ret = wolfSSL_shutdown(client->ssl);
-    }
-    
-    if (ret != WOLFSSL_SUCCESS) {
-        int err = wolfSSL_get_error(client->ssl, ret);
-        DTLS_DEBUG("Shutdown warning: %d (%s)", 
-                   err, wolfSSL_ERR_reason_error_string(err));
-    }
-    
-    wolfSSL_free(client->ssl);
-    client->ssl = NULL;
-    client->connected = 0;
-    
-    DTLS_DEBUG("Disconnected");
-    
-    return 0;
-}
-
-int dtls_client_is_connected(dtls_client_t* client) {
-    return (client != NULL && client->connected);
-}
-
-int dtls_client_send(dtls_client_t* client, const uint8_t* data, size_t len) {
-    int ret;
-    int err;
-    
-    if (client == NULL || !client->connected || client->ssl == NULL) {
-        DTLS_ERROR("Not connected");
-        return -1;
-    }
-    
-    if (data == NULL || len == 0) {
-        return 0;
-    }
-    
-    ret = wolfSSL_write(client->ssl, data, (int)len);
-    
-    if (ret <= 0) {
-        err = wolfSSL_get_error(client->ssl, ret);
-        DTLS_ERROR("wolfSSL_write failed: %d (%s)", 
-                   err, wolfSSL_ERR_reason_error_string(err));
-        return -1;
-    }
-    
-    DTLS_DEBUG("Sent %d bytes", ret);
-    return ret;
-}
-
-int dtls_client_recv(dtls_client_t* client, uint8_t* buf, size_t len) {
-    int ret;
-    int err;
-    
-    if (client == NULL || !client->connected || client->ssl == NULL) {
-        DTLS_ERROR("Not connected");
-        return -1;
-    }
-    if (buf == NULL || len == 0) {
-        return 0;
-    }
-    
-    liteeth_service();
-    ret = wolfSSL_read(client->ssl, buf, (int)len);
-    if (ret <= 0) {
-        err = wolfSSL_get_error(client->ssl, ret);
-        
-        if (err == WOLFSSL_ERROR_WANT_READ) {
-            return 0;
-        }
-        if (err == WOLFSSL_ERROR_ZERO_RETURN) {
-            DTLS_DEBUG("Connection closed by peer");
-            client->connected = 0;
-            return 0;
-        }
-        DTLS_ERROR("wolfSSL_read failed: %d (%s)", 
-                   err, wolfSSL_ERR_reason_error_string(err));
-        return -1;
-    }
-    
-    DTLS_DEBUG("Received %d bytes", ret);
-    return ret;
-}
-
-const char* dtls_client_get_cipher(dtls_client_t* client) {
-
-    if (client == NULL || client->ssl == NULL) {
-        return "N/A";
-    }
-    return wolfSSL_get_cipher(client->ssl);
-}
-
-const char* dtls_client_get_version(dtls_client_t* client) {
-
-    if (client == NULL || client->ssl == NULL) {
-        return "N/A";
-    }
-    return wolfSSL_get_version(client->ssl);
-}
-
-void dtls_client_print_info(dtls_client_t* client) {
-    if (client == NULL || client->ssl == NULL) {
-        return;
-    }
-    
-    printf("\n=== DTLS Connection Info ===\n");
-    printf("  Protocol: %s\n", wolfSSL_get_version(client->ssl));
-    printf("  Cipher:   %s\n", wolfSSL_get_cipher(client->ssl));
-    printf("  Server:   " IP_FMT ":%d\n", 
-           IP_ARGS(client->udp_ctx.remote_ip),
-           client->udp_ctx.remote_port);
-    printf("============================\n\n");
+    return snprintf(buf, maxlen, "Protocol: %s, Cipher: %s", wolfSSL_get_version(client->ssl), wolfSSL_get_cipher(client->ssl));
 }

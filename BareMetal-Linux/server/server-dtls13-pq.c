@@ -40,7 +40,7 @@ int main(int argc, char** argv) {
         return exitVal;
     }
 
-    wolfSSL_Debugging_ON();
+    // wolfSSL_Debugging_ON();
 
     if ((ctx = wolfSSL_CTX_new(wolfDTLSv1_3_server_method())) == NULL) {
         fprintf(stderr, "wolfSSL_CTX_new error.\n");
@@ -112,6 +112,15 @@ int main(int argc, char** argv) {
             goto cleanup;
         }
 
+        // ret = wolfSSL_dtls_set_mtu(ssl, 1400);
+        // if (ret != WOLFSSL_SUCCESS) {
+        //     fprintf(stderr, "Warning: Failed to set DTLS MTU: %d\n", ret);
+        // } else {
+        //     printf("DTLS MTU set to 1400\n");
+        // }
+
+        wolfSSL_dtls13_set_send_more_acks(ssl, 1);
+        printf("Enabled aggressive ACK sending for DTLS 1.3\n");
         if (wolfSSL_dtls_set_peer(ssl, &cliaddr, cliLen) != WOLFSSL_SUCCESS) {
             fprintf(stderr, "wolfSSL_dtls_set_peer error.\n");
             goto cleanup;

@@ -1,225 +1,344 @@
-#include <stdio.h>
-#include <string.h>
 #include "liteeth_udp.h"
 
+#include <stdio.h>
+#include <string.h>
+
 #include <generated/csr.h>
-#include <generated/soc.h>
+#include <generated/mem.h>
 
 #ifdef CSR_ETHMAC_BASE
 #include <libliteeth/udp.h>
 #include <libliteeth/inet.h>
 #endif
 
-static liteeth_udp_ctx_t* g_active_ctx = NULL;  
-static int g_eth_initialized = 0;
+#define LITEETH_UDP_DEBUG 0
 
-#ifdef CSR_ETHMAC_BASE
-static void udp_rx_callback(uint32_t src_ip, uint16_t src_port, 
-                            uint16_t dst_port, void* data, uint32_t length) {
+#if LITEETH_UDP_DEBUG
+#define DBG_PRINT(fmt, ...) printf("[LITEETH] " fmt, ##__VA_ARGS__)
+#else
+#define DBG_PRINT(fmt, ...)
+#endif
 
-    if (g_active_ctx == NULL) {
+static int g_initialized = 0;
+
+static liteeth_packet_t rx_queue[LITEETH_UDP_RX_QUEUE_SIZE];
+static volatile int rx_queue_head = 0;
+static volatile int rx_queue_tail = 0;
+static volatile int rx_queue_count_val = 0;
+
+
+static liteeth_udp_ctx_t *g_active_ctx = NULL;
+
+static int queue_is_full(void) {
+    return rx_queue_count_val >= LITEETH_UDP_RX_QUEUE_SIZE;
+}
+
+static int queue_is_empty(void) {
+    return rx_queue_count_val == 0;
+}
+
+static int queue_push(const uint8_t *data, uint32_t len, uint32_t src_ip, uint16_t src_port, uint16_t dst_port) {
+    if (queue_is_full()) {
+        DBG_PRINT("RX queue full!");
+        return LITEETH_UDP_QUEUE_FULL;
+    }
+    
+    if (len > LITEETH_UDP_MAX_PACKET_SIZE) {
+        len = LITEETH_UDP_MAX_PACKET_SIZE;
+    }
+    
+    liteeth_packet_t *pkt = &rx_queue[rx_queue_head];
+    memcpy(pkt->data, data, len);
+    pkt->len = len;
+    pkt->src_ip = src_ip;
+    pkt->src_port = src_port;
+    pkt->dst_port = dst_port;
+    pkt->valid = 1;
+    
+    rx_queue_head = (rx_queue_head + 1) % LITEETH_UDP_RX_QUEUE_SIZE;
+    rx_queue_count_val++;
+    
+    DBG_PRINT("Queued packet: %lu bytes from " IP_FMT ":%u (queue=%d)\n",
+              (unsigned long)len, IP_ARGS(src_ip), src_port, rx_queue_count_val);
+    
+    return LITEETH_UDP_SUCCESS;
+}
+
+static int queue_pop(uint8_t *buf, size_t maxlen, uint32_t *src_ip,
+                     uint16_t *src_port, uint16_t *dst_port) {
+    if (queue_is_empty()) {
+        return LITEETH_UDP_QUEUE_EMPTY;
+    }
+    
+    liteeth_packet_t *pkt = &rx_queue[rx_queue_tail];
+    
+    size_t copy_len = (pkt->len < maxlen) ? pkt->len : maxlen;
+    memcpy(buf, pkt->data, copy_len);
+    
+    if (src_ip) *src_ip = pkt->src_ip;
+    if (src_port) *src_port = pkt->src_port;
+    if (dst_port) *dst_port = pkt->dst_port;
+    
+    pkt->valid = 0;
+    rx_queue_tail = (rx_queue_tail + 1) % LITEETH_UDP_RX_QUEUE_SIZE;
+    rx_queue_count_val--;
+    
+    DBG_PRINT("Dequeued packet: %u bytes (queue=%d)\n", 
+              (unsigned)copy_len, rx_queue_count_val);
+    
+    return (int)copy_len;
+}
+
+static void udp_rx_callback(uint32_t src_ip, uint16_t src_port, uint16_t dst_port, void *data, uint32_t length) {
+    DBG_PRINT("RX callback: %lu bytes from " IP_FMT ":%u to port %u\n",
+              (unsigned long)length, IP_ARGS(src_ip), (unsigned)src_port, (unsigned)dst_port);
+
+    if (g_active_ctx != NULL) {
+        DBG_PRINT("Filter: expecting from " IP_FMT ":%u to port %u\n",
+                  IP_ARGS(g_active_ctx->remote_ip),
+                  (unsigned)g_active_ctx->remote_port,
+                  (unsigned)g_active_ctx->local_port);
+
+        if (g_active_ctx->remote_ip != 0 && src_ip != g_active_ctx->remote_ip) {
+            DBG_PRINT("Dropping packet: IP mismatch (got " IP_FMT ", expected " IP_FMT ")\n",
+                      IP_ARGS(src_ip), IP_ARGS(g_active_ctx->remote_ip));
+            return;
+        }
+        if (g_active_ctx->remote_port != 0 && src_port != g_active_ctx->remote_port) {
+            DBG_PRINT("Dropping packet: src port mismatch (got %u, expected %u)\n",
+                      (unsigned)src_port, (unsigned)g_active_ctx->remote_port);
+            return;
+        }
+        if (dst_port != g_active_ctx->local_port) {
+            DBG_PRINT("Dropping packet: dst port mismatch (got %u, expected %u)\n",
+                      (unsigned)dst_port, (unsigned)g_active_ctx->local_port);
+            return;
+        }
+        DBG_PRINT("Packet passed filter\n");
+    }
+
+    int ret = queue_push((const uint8_t *)data, length, src_ip, src_port, dst_port);
+    DBG_PRINT("queue_push returned %d, queue count=%d\n", ret, rx_queue_count_val);
+    (void)ret;
+}
+
+int liteeth_init(const uint8_t *mac, uint32_t ip) {
+    if (g_initialized) {
+        return LITEETH_UDP_SUCCESS;
+    }
+    
+        DBG_PRINT("Initializing UDP layer\n");
+        DBG_PRINT("MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        DBG_PRINT("IP: " IP_FMT "\n", IP_ARGS(ip));
+    
+    eth_init();
+    udp_start(mac, ip);
+    
+    DBG_PRINT("Setting UDP callback...\n");
+    udp_set_callback(udp_rx_callback);
+    DBG_PRINT("UDP callback set\n");
+    
+    memset(rx_queue, 0, sizeof(rx_queue));
+    rx_queue_head = 0;
+    rx_queue_tail = 0;
+    rx_queue_count_val = 0;
+    
+    g_active_ctx = NULL;
+    g_initialized = 1;
+    
+    DBG_PRINT("UDP layer initialized\n");
+    
+    return LITEETH_UDP_SUCCESS;
+}
+
+void liteeth_udp_cleanup(void) {
+    if (!g_initialized) {
         return;
     }
     
-    if (src_ip == g_active_ctx->remote_ip && 
-        src_port == g_active_ctx->remote_port &&
-        dst_port == g_active_ctx->local_port) {
-        
-        if (length <= LITEETH_RX_BUFFER_SIZE) {
-            memcpy(g_active_ctx->rx_buffer, data, length);
-            g_active_ctx->rx_data_len = length;
-            g_active_ctx->rx_read_pos = 0;
-            g_active_ctx->has_pending_data = 1;
-        }
-    }
+    udp_set_callback(NULL);
+    liteeth_udp_rx_queue_clear();
+    
+    g_active_ctx = NULL;
+    g_initialized = 0;
+    
+    DBG_PRINT("UDP layer cleaned up\n");
 }
-#endif
 
-int liteeth_init(const uint8_t* mac, uint32_t ip) {
-
-#ifdef CSR_ETHMAC_BASE
-    if (g_eth_initialized) {
-        return 0;  
+int liteeth_udp_connect(liteeth_udp_ctx_t *ctx, uint16_t local_port, uint32_t remote_ip, uint16_t remote_port) {
+    if (!g_initialized) {
+        return LITEETH_UDP_NOT_INIT;
     }
     
-    printf("[LiteETH] Initializing ethernet...\n");
-    eth_init();
-    udp_start(mac, ip);
-    udp_set_callback(udp_rx_callback);
-    g_eth_initialized = 1;
-    printf("[LiteETH] Initialized with IP: " IP_FMT "\n", IP_ARGS(ip));
-    return 0;
-#else
-    printf("[LiteETH] Error: Ethernet not available in this build\n");
-    return -1;
-#endif
-}
-
-int liteeth_udp_ctx_init(liteeth_udp_ctx_t* ctx, 
-                         uint16_t local_port,
-                         uint32_t remote_ip, 
-                         uint16_t remote_port) {
-
     if (ctx == NULL) {
-        return -1;
+        return LITEETH_UDP_ERROR;
     }
     
-    memset(ctx, 0, sizeof(liteeth_udp_ctx_t));
+    liteeth_udp_rx_queue_clear();
+    DBG_PRINT("Resolving ARP for " IP_FMT "...\n", IP_ARGS(remote_ip));
+    if (!udp_arp_resolve(remote_ip)) {
+        DBG_PRINT("ARP resolution failed\n");
+        return LITEETH_UDP_ARP_FAILED;
+    }
+    DBG_PRINT("ARP resolved\n");
     
-    ctx->local_port = local_port;
+    ctx->local_ip = udp_get_ip();
     ctx->remote_ip = remote_ip;
+    ctx->local_port = local_port;
     ctx->remote_port = remote_port;
     ctx->initialized = 1;
-    ctx->has_pending_data = 0;
-    ctx->rx_data_len = 0;
-    ctx->rx_read_pos = 0;
+    ctx->connected = 1;
     
     g_active_ctx = ctx;
     
-    printf("[LiteETH] UDP context initialized:\n");
-    printf("  Local port: %d\n", local_port);
-    printf("  Remote: " IP_FMT ":%d\n", IP_ARGS(remote_ip), remote_port);
+    DBG_PRINT("Connected: local port %u -> " IP_FMT ":%u\n",
+              local_port, IP_ARGS(remote_ip), remote_port);
     
-    return 0;
+    return LITEETH_UDP_SUCCESS;
 }
 
-void liteeth_udp_ctx_free(liteeth_udp_ctx_t* ctx) {
-
-    if (ctx == g_active_ctx) {
+void liteeth_udp_close(liteeth_udp_ctx_t *ctx) {
+    if (ctx == NULL) {
+        return;
+    }
+    
+    if (g_active_ctx == ctx) {
         g_active_ctx = NULL;
     }
-    if (ctx != NULL) {
-        memset(ctx, 0, sizeof(liteeth_udp_ctx_t));
-    }
+    
+    ctx->connected = 0;
+    ctx->initialized = 0;
+    
+    liteeth_udp_rx_queue_clear();
+    
+    DBG_PRINT("Connection closed\n");
 }
 
-int liteeth_udp_send(liteeth_udp_ctx_t* ctx, const uint8_t* data, size_t len) {
-
-#ifdef CSR_ETHMAC_BASE
-    if (ctx == NULL || !ctx->initialized || data == NULL) {
-        printf("[LiteETH] Send: invalid params (ctx=%p, init=%d, data=%p)\n", 
-               (void*)ctx, ctx ? ctx->initialized : 0, (void*)data);
-        return -1;
+int liteeth_udp_send(liteeth_udp_ctx_t *ctx, const uint8_t *data, size_t len) {
+    if (!g_initialized) {
+        return LITEETH_UDP_NOT_INIT;
     }
     
-    if (len > LITEETH_MAX_PACKET_SIZE) {
-        printf("[LiteETH] Error: Packet too large (%zu > %d)\n", 
-               len, LITEETH_MAX_PACKET_SIZE);
-        return -1;
+    if (ctx == NULL || !ctx->connected) {
+        return LITEETH_UDP_ERROR;
     }
     
-    printf("[LiteETH] Sending %zu bytes to " IP_FMT ":%d from port %d\n",
-           len, IP_ARGS(ctx->remote_ip), ctx->remote_port, ctx->local_port);
-    
-    printf("[LiteETH] Resolving ARP for " IP_FMT "...\n", IP_ARGS(ctx->remote_ip));
-    if (!udp_arp_resolve(ctx->remote_ip)) {
-        printf("[LiteETH] ARP resolution failed for " IP_FMT "\n", 
-               IP_ARGS(ctx->remote_ip));
-        return -1;
+    if (len > LITEETH_UDP_MAX_PACKET_SIZE) {
+        printf("[LITEETH] Warning: packet too large (%u), truncating\n", (unsigned)len);
+        len = LITEETH_UDP_MAX_PACKET_SIZE;
     }
-    printf("[LiteETH] ARP resolved successfully\n");
     
-    void* tx_buf = udp_get_tx_buffer();
-    if (tx_buf == NULL) {
-        printf("[LiteETH] Failed to get TX buffer\n");
-        return -1;
-    }
+    void *tx_buf = udp_get_tx_buffer();
     memcpy(tx_buf, data, len);
-    printf("[LiteETH] Copied %zu bytes to TX buffer\n", len);
     
-    printf("[LiteETH] Calling udp_send(local=%d, remote=%d, len=%zu)\n",
-           ctx->local_port, ctx->remote_port, len);
-    int ret = udp_send(ctx->local_port, ctx->remote_port, len);
-    printf("[LiteETH] udp_send returned %d\n", ret);
+    DBG_PRINT("Sending %u bytes to " IP_FMT ":%u\n", (unsigned)len, IP_ARGS(ctx->remote_ip), ctx->remote_port);
+    
+    int ret = udp_send(ctx->local_port, ctx->remote_port, (uint32_t)len);
     
     if (ret == 0) {
-        printf("[LiteETH] Send failed (ret=0)\n");
-        return -1;
+        printf("[LITEETH] Send failed (ARP not resolved?)\n");
+        return LITEETH_UDP_ERROR;
     }
     
-    printf("[LiteETH] Successfully sent %zu bytes\n", len);
     return (int)len;
-#else
-    (void)ctx;
-    (void)data;
-    (void)len;
-    return -1;
-#endif
 }
 
-int liteeth_udp_recv(liteeth_udp_ctx_t* ctx, uint8_t* buf, size_t len, uint32_t timeout_ms) {
-
-#ifdef CSR_ETHMAC_BASE
-    if (ctx == NULL || !ctx->initialized || buf == NULL) {
-        return -1;
+int liteeth_udp_recv(liteeth_udp_ctx_t *ctx, uint8_t *buf, size_t maxlen,
+                     uint32_t timeout_ms) {
+    if (!g_initialized) {
+        return LITEETH_UDP_NOT_INIT;
     }
     
+    if (ctx == NULL || !ctx->connected) {
+        return LITEETH_UDP_ERROR;
+    }
     
-    uint32_t elapsed = 0;
-    const uint32_t poll_interval = 1;  
+    DBG_PRINT("recv: waiting for packet (timeout=%lu ms)\n", (unsigned long)timeout_ms);
     
-    while (elapsed < timeout_ms || timeout_ms == 0) {
-        
-        liteeth_service();
-        if (ctx->has_pending_data && ctx->rx_data_len > ctx->rx_read_pos) {
-            size_t available = ctx->rx_data_len - ctx->rx_read_pos;
-            size_t to_copy = (len < available) ? len : available;
-            
-            memcpy(buf, ctx->rx_buffer + ctx->rx_read_pos, to_copy);
-            ctx->rx_read_pos += to_copy;
-            
-            if (ctx->rx_read_pos >= ctx->rx_data_len) {
-                ctx->has_pending_data = 0;
-                ctx->rx_data_len = 0;
-                ctx->rx_read_pos = 0;
-            }
-            
-            return (int)to_copy;
+    uint32_t iterations = 0;
+    uint32_t max_iterations = 100000000U;
+    
+    while (iterations < max_iterations) {
+        udp_service();
+        int ret = queue_pop(buf, maxlen, NULL, NULL, NULL);
+        if (ret > 0) {
+            DBG_PRINT("recv: got %d bytes after %lu iterations\n", ret, (unsigned long)iterations);
+            return ret;
         }
         
-        if (timeout_ms == 0) {
-            return 0;  
+        for (volatile int i = 0; i < 10; i++);
+        
+        iterations++;
+        if ((iterations % 100000U) == 0) {
+            DBG_PRINT("recv: still waiting... (%lu iterations)\n", (unsigned long)iterations);
         }
-        
-        
-        for (volatile int i = 0; i < 10000; i++) {}
-        elapsed += poll_interval;
     }
     
-    return 0;  
-#else
-    (void)ctx;
-    (void)buf;
-    (void)len;
-    (void)timeout_ms;
-    return -1;
-#endif
+    DBG_PRINT("recv: timeout after %lu iterations\n", (unsigned long)iterations);
+    return LITEETH_UDP_TIMEOUT;
 }
 
-int liteeth_udp_data_available(liteeth_udp_ctx_t* ctx) {
-
-    if (ctx == NULL || !ctx->initialized) {
-        return 0;
+int liteeth_udp_recv_nonblock(liteeth_udp_ctx_t *ctx, uint8_t *buf, size_t maxlen) {
+    if (!g_initialized) {
+        return LITEETH_UDP_NOT_INIT;
     }
     
-    liteeth_service();
-    return ctx->has_pending_data;
+    if (ctx == NULL || !ctx->connected) {
+        return LITEETH_UDP_ERROR;
+    }
+    
+    udp_service();
+    
+    int ret = queue_pop(buf, maxlen, NULL, NULL, NULL);
+    if (ret == LITEETH_UDP_QUEUE_EMPTY) {
+        return LITEETH_UDP_WOULD_BLOCK;
+    }
+    
+    return ret;
 }
-void liteeth_service(void) {
 
-#ifdef CSR_ETHMAC_BASE
-    if (g_eth_initialized) {
+static uint32_t g_service_count = 0;
+
+void liteeth_udp_service(void) {
+    if (g_initialized) {
+        g_service_count++;
+        if ((g_service_count % 50000) == 0) {
+            DBG_PRINT("udp_service called %lu times, queue=%d\n",
+                      (unsigned long)g_service_count, rx_queue_count_val);
+        }
         udp_service();
     }
-#endif
 }
 
-int liteeth_arp_resolve(uint32_t ip) {
+int liteeth_udp_arp_resolve(uint32_t ip) {
+    if (!g_initialized) {
+        return LITEETH_UDP_NOT_INIT;
+    }
+    
+    if (udp_arp_resolve(ip)) {
+        return LITEETH_UDP_SUCCESS;
+    }
+    
+    return LITEETH_UDP_ARP_FAILED;
+}
 
-#ifdef CSR_ETHMAC_BASE
-    return udp_arp_resolve(ip);
-#else
-    (void)ip;
-    return 0;
-#endif
+int liteeth_udp_rx_queue_count(void) {
+    return rx_queue_count_val;
+}
+
+int liteeth_udp_rx_pending(void) {
+    return rx_queue_count_val > 0 ? 1 : 0;
+}
+
+void liteeth_udp_rx_queue_clear(void) {
+    rx_queue_head = 0;
+    rx_queue_tail = 0;
+    rx_queue_count_val = 0;
+    
+    for (int i = 0; i < LITEETH_UDP_RX_QUEUE_SIZE; i++) {
+        rx_queue[i].valid = 0;
+    }
+    
+    DBG_PRINT("RX queue cleared\n");
 }

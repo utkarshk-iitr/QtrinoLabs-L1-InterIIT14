@@ -11035,8 +11035,6 @@ int SendBuffered(WOLFSSL* ssl)
 {
     int retryLimit = WOLFSSL_MODE_AUTO_RETRY_ATTEMPTS;
 
-    printf("[DEBUG] SendBuffered() ENTERED\n");
-
     if (ssl == NULL) {
         WOLFSSL_MSG("ssl is null");
         return BAD_FUNC_ARG;
@@ -11044,12 +11042,8 @@ int SendBuffered(WOLFSSL* ssl)
 
     if (ssl->CBIOSend == NULL && !WOLFSSL_IS_QUIC(ssl)) {
         WOLFSSL_MSG("Your IO Send callback is null, please set");
-        printf("[DEBUG] SendBuffered: CBIOSend is NULL!\n");
         return SOCKET_ERROR_E;
     }
-
-    printf("[DEBUG] SendBuffered: outputBuffer.length = %lu, CBIOSend = %p\n",
-           (unsigned long)ssl->buffers.outputBuffer.length, (void*)ssl->CBIOSend);
 
 #ifdef WOLFSSL_QUIC
     if (WOLFSSL_IS_QUIC(ssl)) {
@@ -11060,14 +11054,11 @@ int SendBuffered(WOLFSSL* ssl)
     while (ssl->buffers.outputBuffer.length > 0) {
         int sent = 0;
 retry:
-        printf("[DEBUG] SendBuffered: About to call CBIOSend with %lu bytes\n",
-               (unsigned long)ssl->buffers.outputBuffer.length);
         sent = ssl->CBIOSend(ssl,
                              (char*)ssl->buffers.outputBuffer.buffer +
                              ssl->buffers.outputBuffer.idx,
                              (int)ssl->buffers.outputBuffer.length,
                              ssl->IOCB_WriteCtx);
-        printf("[DEBUG] SendBuffered: CBIOSend returned %d\n", sent);
         if (sent < 0) {
             switch (sent) {
 

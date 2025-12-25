@@ -166,42 +166,23 @@ int Dtls13RlAddPlaintextHeader(WOLFSSL* ssl, byte* out,
     word32 seq[2];
     int ret;
 
-    printf("[DEBUG] Dtls13RlAddPlaintextHeader ENTERED\n"); fflush(stdout);
 
     hdr = (Dtls13RecordPlaintextHeader*)out;
     hdr->contentType = content_type;
     hdr->legacyVersionRecord.major = DTLS_MAJOR;
     hdr->legacyVersionRecord.minor = DTLSv1_2_MINOR;
 
-    printf("[DEBUG] Calling Dtls13GetSeq...\n"); fflush(stdout);
     ret = Dtls13GetSeq(ssl, CUR_ORDER, seq, 1);
-    printf("[DEBUG] Dtls13GetSeq returned %d, seq=[%u,%u]\n", ret, seq[0], seq[1]); fflush(stdout);
     if (ret != 0)
         return ret;
 
     /* seq[0] combines the epoch and 16 MSB of sequence number. We write on the
        epoch field and will overflow to the first two bytes of the sequence
        number */
-    printf("[DEBUG] Writing header fields...\n"); fflush(stdout);
-    printf("[DEBUG] hdr=%p, out=%p\n", (void*)hdr, (void*)out); fflush(stdout);
-    
-    printf("[DEBUG] Writing epoch...\n"); fflush(stdout);
     c16toa((word16)(seq[0] >> 16), hdr->epoch);
-    printf("[DEBUG] epoch done\n"); fflush(stdout);
-    
-    printf("[DEBUG] Writing sequenceNumber[0-1]...\n"); fflush(stdout);
     c16toa((word16)seq[0], hdr->sequenceNumber);
-    printf("[DEBUG] seq[0-1] done\n"); fflush(stdout);
-    
-    printf("[DEBUG] Writing sequenceNumber[2-5]...\n"); fflush(stdout);
     c32toa(seq[1], &hdr->sequenceNumber[2]);
-    printf("[DEBUG] seq[2-5] done\n"); fflush(stdout);
-    
-    printf("[DEBUG] Writing length...\n"); fflush(stdout);
     c16toa(length, hdr->length);
-    printf("[DEBUG] length done\n"); fflush(stdout);
-
-    printf("[DEBUG] Dtls13RlAddPlaintextHeader DONE\n"); fflush(stdout);
     return 0;
 }
 
@@ -565,7 +546,6 @@ static int Dtls13SendFragment(WOLFSSL* ssl, byte* output, word16 output_size,
     byte* msg;
     int ret;
 
-    printf("[DEBUG] Dtls13SendFragment() ENTERED (len=%d, sendNow=%d)\n", length, sendImmediately); fflush(stdout);
 
     if (output_size < length)
         return BUFFER_ERROR;
@@ -579,9 +559,7 @@ static int Dtls13SendFragment(WOLFSSL* ssl, byte* output, word16 output_size,
     recordLength = length - recordHeaderLength;
 
     if (!isProtected) {
-        printf("[DEBUG] Adding plaintext header (unprotected)...\n"); fflush(stdout);
         ret = Dtls13RlAddPlaintextHeader(ssl, output, handshake, recordLength);
-        printf("[DEBUG] Dtls13RlAddPlaintextHeader returned %d\n", ret); fflush(stdout);
         if (ret != 0)
             return ret;
     }
@@ -596,27 +574,21 @@ static int Dtls13SendFragment(WOLFSSL* ssl, byte* output, word16 output_size,
 
         sendLength = BuildTls13Message(ssl, output, output_size, msg,
             recordLength, handshake, 0, 0, 0);
-        printf("[DEBUG] BuildTls13Message returned %d\n", sendLength);
         if (sendLength < 0)
             return sendLength;
 
         length = (word16)sendLength;
     }
 
-    printf("[DEBUG] FragIsInOutputBuffer = %d\n", FragIsInOutputBuffer(ssl, output)); fflush(stdout);
     if (!FragIsInOutputBuffer(ssl, output)) {
-        printf("[DEBUG] Calling Dtls13SendFragFromBuffer...\n"); fflush(stdout);
         return Dtls13SendFragFromBuffer(ssl, output, length);
     }
 
     ssl->buffers.outputBuffer.length += length;
-    printf("[DEBUG] outputBuffer.length now = %lu\n", (unsigned long)ssl->buffers.outputBuffer.length); fflush(stdout);
 
     ret = 0;
     if (sendImmediately) {
-        printf("[DEBUG] sendImmediately=1, calling SendBuffered...\n"); fflush(stdout);
         ret = SendBuffered(ssl);
-        printf("[DEBUG] SendBuffered returned %d\n", ret); fflush(stdout);
     }
 
     return ret;
@@ -981,27 +953,20 @@ static int Dtls13SendOneFragmentRtx(WOLFSSL* ssl,
     byte isProtected;
     int ret;
 
-    printf("[DEBUG] Dtls13SendOneFragmentRtx() ENTERED\n");
-
     isProtected = Dtls13TypeIsEncrypted(handshakeType);
     recordHeaderLength = Dtls13GetRlHeaderLength(ssl, isProtected);
 
     if (handshakeType != hello_retry_request) {
-        printf("[DEBUG] Creating RTX record...\n");
         rtxRecord = Dtls13RtxNewRecord(ssl, message + recordHeaderLength,
             (word16)(length - recordHeaderLength), handshakeType,
             ssl->dtls13EncryptEpoch->nextSeqNumber);
         if (rtxRecord == NULL) {
-            printf("[DEBUG] RTX record creation FAILED (MEMORY_E)\n");
             return MEMORY_E;
         }
-        printf("[DEBUG] RTX record created successfully\n");
     }
 
-    printf("[DEBUG] Calling Dtls13SendFragment...\n");
     ret = Dtls13SendFragment(ssl, message, outputSize, (word16)length,
         handshakeType, hashOutput, Dtls13SendNow(ssl, handshakeType));
-    printf("[DEBUG] Dtls13SendFragment returned %d\n", ret);
 
     if (rtxRecord != NULL) {
         if (ret == 0 || ret == WC_NO_ERR_TRACE(WANT_WRITE))
@@ -1874,7 +1839,7 @@ static int _Dtls13HandshakeRecv(WOLFSSL* ssl, byte* input, word32 size,
     isComplete = isFirst && fragLength == messageLength;
 
     if (!isComplete && !Dtls13AcceptFragmented(ssl, (enum HandShakeType)handshakeType)) {
-#ifdef WOLFSSL_DTLS_CH_FRAG
+#if defined(WOLFSSL_DTLS_CH_FRAG) && !defined(NO_WOLFSSL_SERVER)
         byte tls13 = 0;
         /* check if the first CH fragment contains a valid cookie */
         if (ssl->options.dtls13ChFrag && !ssl->options.dtlsStateful &&
@@ -1882,14 +1847,6 @@ static int _Dtls13HandshakeRecv(WOLFSSL* ssl, byte* input, word32 size,
                 DoClientHelloStateless(ssl, input + idx, fragLength, 1, &tls13)
                     == 0 && tls13) {
             /* We can save this message and continue as stateful. */
-            if (ssl->chGoodCb != NULL) {
-                int cbret = ssl->chGoodCb(ssl, ssl->chGoodCtx);
-                if (cbret < 0) {
-                    ssl->error = cbret;
-                    WOLFSSL_MSG("ClientHello Good Cb don't continue error");
-                    return WOLFSSL_FATAL_ERROR;
-                }
-            }
             WOLFSSL_MSG("ClientHello fragment verified");
         }
         else

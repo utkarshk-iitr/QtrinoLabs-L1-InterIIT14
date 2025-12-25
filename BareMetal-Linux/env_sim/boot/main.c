@@ -30,55 +30,156 @@ static const uint8_t my_mac[6] = {0xaa, 0xb6, 0x24, 0x69, 0x77, 0x21};
 
 #include <wolfssl/wolfcrypt/types.h>
 
-int CustomRngGenerateBlock(byte *output, word32 sz) {
-    for (word32 i = 0; i < sz; i++) {
-        output[i] = (byte)(i * 37 + 123); // placeholder (NOT SECURE!)
+
+static struct {
+    uint32_t state;
+    uint32_t pool[8];
+    uint32_t pool_idx;
+    int initialized;
+} trng_ctx = {0};
+
+static void trng_init(void) {
+    if (trng_ctx.initialized) return;
+    trng_ctx.state = 0x5A5A5A5A;
+    for (int i = 0; i < 8; i++) {
+        timer0_update_value_write(1);
+        uint32_t t1 = timer0_value_read();
+        for (volatile int j = 0; j < 100; j++);
+        
+        timer0_update_value_write(1);
+        uint32_t t2 = timer0_value_read();
+        trng_ctx.pool[i] = t1 ^ (t2 << 16) ^ (t2 >> 16);
+        trng_ctx.pool[i] ^= (uint32_t)(i * 0x9E3779B9);
     }
+    
+    trng_ctx.pool_idx = 0;
+    trng_ctx.initialized = 1;
+}
+
+static uint32_t trng_mix(uint32_t x) {
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return x;
+}
+
+static uint32_t trng_get_u32(void) {
+    if (!trng_ctx.initialized) {
+        trng_init();
+    }
+
+    timer0_update_value_write(1);
+    uint32_t timer_val = timer0_value_read();
+    
+    trng_ctx.pool_idx = (trng_ctx.pool_idx + 1) & 7;
+    trng_ctx.pool[trng_ctx.pool_idx] ^= timer_val;
+    
+    trng_ctx.state ^= trng_ctx.pool[trng_ctx.pool_idx];
+    trng_ctx.state = trng_mix(trng_ctx.state);
+    trng_ctx.state ^= trng_ctx.pool[(trng_ctx.pool_idx + 3) & 7];
+    trng_ctx.state = trng_mix(trng_ctx.state);
+    
+    trng_ctx.pool[trng_ctx.pool_idx] = trng_mix(trng_ctx.pool[trng_ctx.pool_idx] ^ trng_ctx.state);
+    
+    return trng_ctx.state;
+}
+
+int CustomRngGenerateBlock(byte *output, word32 sz) {
+    static int call_count = 0;
+    word32 i = 0;
+    uint32_t rand_val;
+    
+    if (!trng_ctx.initialized) {
+        trng_init();
+    }
+    
+    call_count++;
+    
+    while (i < sz) {
+        rand_val = trng_get_u32();
+        
+        for (int j = 0; j < 4 && i < sz; j++, i++) {
+            output[i] = (byte)((rand_val >> (j * 8)) & 0xFF);
+        }
+    }
+    
     return 0;
 }
 
 #include <sys/time.h>
 #include <time.h>
 
+#include <generated/soc.h>
+
 int gettimeofday(struct timeval* tv, void* tz) {
     (void)tz;
-    if (tv) {
-        tv->tv_sec = 0;
-        tv->tv_usec = 0;
+
+    static int inited;
+    static uint64_t usec_accum;
+    static uint32_t last_timer;
+
+    if (!inited) {
+        timer0_en_write(0);
+        timer0_reload_write(0xFFFFFFFFu);
+        timer0_load_write(0xFFFFFFFFu);
+        timer0_en_write(1);
+
+        timer0_update_value_write(1);
+        last_timer = timer0_value_read();
+        usec_accum = 0;
+        inited = 1;
     }
+
+    timer0_update_value_write(1);
+    uint32_t cur = timer0_value_read();
+
+    uint32_t elapsed_ticks = (last_timer >= cur)
+        ? (last_timer - cur)
+        : (last_timer + (0xFFFFFFFFu - cur) + 1u);
+    last_timer = cur;
+
+    if (elapsed_ticks != 0) {
+        usec_accum += ((uint64_t)elapsed_ticks * 1000000ull) / (uint64_t)CONFIG_CLOCK_FREQUENCY;
+    }
+
+    if (tv) {
+        tv->tv_sec = (time_t)(usec_accum / 1000000ull);
+        tv->tv_usec = (suseconds_t)(usec_accum % 1000000ull);
+    }
+
     return 0;
 }
 
 
-/* Read a line from UART with echo, returns length (excluding null terminator) */
+
 static int read_line(char* buf, int maxlen) {
     int i = 0;
     char c;
     
     while (i < maxlen - 1) {
-        /* Wait for character */
+        
         while (!uart_read_nonblock()) {
-            /* Could add a small delay or service network here */
+            
         }
         c = uart_read();
         
-        /* Handle backspace */
+        
         if (c == '\b' || c == 127) {
             if (i > 0) {
                 i--;
-                printf("\b \b");  /* Erase character on terminal */
+                printf("\b \b");  
             }
             continue;
         }
         
-        /* Handle enter (CR or LF) */
+        
         if (c == '\r' || c == '\n') {
             printf("\n");
             buf[i] = '\0';
             return i;
         }
         
-        /* Echo and store printable characters */
+        
         if (c >= 32 && c < 127) {
             buf[i++] = c;
             printf("%c", c);
@@ -108,7 +209,7 @@ static int run_dtls_client_demo(void) {
     const uint8_t* ca_cert = get_ca_cert_buffer(&ca_len);
     dtls_client_config_set_ca_cert(&config, ca_cert, ca_len);
     
-    config.verify_peer = 1;  
+    config.verify_peer = 0;  
     
     printf("[MAIN] Initializing DTLS client...\n");
     printf("       Server: " IP_FMT ":%d\n", IP_ARGS(SERVER_IP), SERVER_PORT);
@@ -129,55 +230,76 @@ static int run_dtls_client_demo(void) {
     }
     
     printf("[MAIN] Connected successfully!\n");
-    printf("[MAIN] Type messages to send (type 'exit' to quit):\n");
-    printf(">> ");
     
-    /* Interactive message loop */
-    while (1) {
-        /* Read a line from UART */
-        send_len = read_line(send_buf, sizeof(send_buf) - 1);
-        
-        /* Check for exit command */
-        if (send_len >= 4 && strncmp(send_buf, "exit", 4) == 0) {
-            printf("[MAIN] Exiting...\n");
-            break;
-        }
-        
-        /* Skip empty lines */
-        if (send_len == 0) {
-            printf(">> ");
-            continue;
-        }
-        
-        /* Add newline for server compatibility */
-        send_buf[send_len] = '\n';
-        send_buf[send_len + 1] = '\0';
-        send_len++;
-        
-        /* Send message */
-        printf("[MAIN] Sending: %s", send_buf);
-        ret = dtls_client_send(&client, (const uint8_t*)send_buf, send_len);
-        if (ret < 0) {
-            printf("[MAIN] Send failed: %d\n", ret);
-            break;
-        }
-        printf("[MAIN] Sent %d bytes\n", ret);
-        
-        /* Wait for response */
-        printf("[MAIN] Waiting for response...\n");
-        recv_len = dtls_client_recv(&client, recv_buf, sizeof(recv_buf) - 1);
-        if (recv_len > 0) {
-            recv_buf[recv_len] = '\0';
-            printf("[MAIN] Server: %s", recv_buf);
-        } else if (recv_len == 0) {
-            printf("[MAIN] No response received\n");
-        } else {
-            printf("[MAIN] Receive error: %d\n", recv_len);
-            break;
-        }
-        
-        printf(">> ");
-    }
+    // strcpy(send_buf, "heyjude\n");
+    // send_len = (int)strlen(send_buf);
+    // printf("[MAIN] Sending: %s", send_buf);
+    // ret = dtls_client_send(&client, (const uint8_t*)send_buf, send_len);
+    // if (ret < 0) {
+    //     printf("[MAIN] Send failed: %d\n", ret);
+    // } else {
+    //     printf("[MAIN] Sent %d bytes\n", ret);
+    //     printf("[MAIN] Waiting for response...\n");
+    //     recv_len = dtls_client_recv(&client, recv_buf, sizeof(recv_buf) - 1);
+    //     if (recv_len > 0) {
+    //         recv_buf[recv_len] = '\0';
+    //         printf("[MAIN] Server: %s", recv_buf);
+    //     } else if (recv_len == 0) {
+    //         printf("[MAIN] No response received\n");
+    //     } else {
+    //         printf("[MAIN] Receive error: %d\n", recv_len);
+    //     }
+    // }
+
+   printf("[MAIN] Type messages to send (type 'exit' to quit):\n");
+   printf(">> ");
+
+   
+   while (1) {
+       
+       send_len = read_line(send_buf, sizeof(send_buf) - 1);
+       
+       
+       if (send_len >= 4 && strncmp(send_buf, "exit", 4) == 0) {
+           printf("[MAIN] Exiting...\n");
+           break;
+       }
+       
+       
+       if (send_len == 0) {
+           printf(">> ");
+           continue;
+       }
+       
+       
+       send_buf[send_len] = '\n';
+       send_buf[send_len + 1] = '\0';
+       send_len++;
+       
+       
+       printf("[MAIN] Sending: %s", send_buf);
+       ret = dtls_client_send(&client, (const uint8_t*)send_buf, send_len);
+       if (ret < 0) {
+           printf("[MAIN] Send failed: %d\n", ret);
+           break;
+       }
+       printf("[MAIN] Sent %d bytes\n", ret);
+       
+       
+       printf("[MAIN] Waiting for response...\n");
+       recv_len = dtls_client_recv(&client, recv_buf, sizeof(recv_buf) - 1);
+       if (recv_len > 0) {
+           recv_buf[recv_len] = '\0';
+           printf("[MAIN] Server: %s", recv_buf);
+       } else if (recv_len == 0) {
+           printf("[MAIN] No response received\n");
+       } else {
+           printf("[MAIN] Receive error: %d\n", recv_len);
+           break;
+       }
+       
+       printf(">> ");
+   }
     
     printf("[MAIN] Disconnecting...\n");
     dtls_client_disconnect(&client);
